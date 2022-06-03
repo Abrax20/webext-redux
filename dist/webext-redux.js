@@ -1016,7 +1016,8 @@ var defaultOpts = {
   extensionId: null,
   serializer: noop,
   deserializer: noop,
-  patchStrategy: shallowDiff
+  patchStrategy: shallowDiff,
+  maxReconnects: 10
 };
 
 var Store = /*#__PURE__*/function () {
@@ -1039,7 +1040,9 @@ var Store = /*#__PURE__*/function () {
         _ref$deserializer = _ref.deserializer,
         deserializer = _ref$deserializer === void 0 ? defaultOpts.deserializer : _ref$deserializer,
         _ref$patchStrategy = _ref.patchStrategy,
-        patchStrategy = _ref$patchStrategy === void 0 ? defaultOpts.patchStrategy : _ref$patchStrategy;
+        patchStrategy = _ref$patchStrategy === void 0 ? defaultOpts.patchStrategy : _ref$patchStrategy,
+        _ref$maxReconnects = _ref.maxReconnects,
+        maxReconnects = _ref$maxReconnects === void 0 ? defaultOpts.maxReconnects : _ref$maxReconnects;
 
     _classCallCheck(this, Store);
 
@@ -1059,74 +1062,101 @@ var Store = /*#__PURE__*/function () {
       throw new Error('patchStrategy must be one of the included patching strategies or a custom patching function');
     }
 
+    this.maxReconnects = maxReconnects;
     this.portName = portName;
     this.readyResolved = false;
     this.readyPromise = new Promise(function (resolve) {
-      return _this.readyResolve = resolve;
+      _this.readyResolve = resolve;
     });
     this.browserAPI = getBrowserAPI();
     this.extensionId = extensionId; // keep the extensionId as an instance variable
 
-    this.port = this.browserAPI.runtime.connect(this.extensionId, {
-      name: portName
-    });
+    this.serializedMessageSender = withSerializer(serializer)(function () {
+      var _this$browserAPI$runt;
+
+      (_this$browserAPI$runt = _this.browserAPI.runtime).sendMessage.apply(_this$browserAPI$runt, arguments);
+    }, 1);
+    this.listeners = [];
+    this.state = state;
+    this.patchStrategy = patchStrategy;
     this.safetyHandler = this.safetyHandler.bind(this);
 
     if (this.browserAPI.runtime.onMessage) {
       this.safetyMessage = this.browserAPI.runtime.onMessage.addListener(this.safetyHandler);
     }
 
-    this.serializedPortListener = withDeserializer(deserializer)(function () {
-      var _this$port$onMessage;
-
-      return (_this$port$onMessage = _this.port.onMessage).addListener.apply(_this$port$onMessage, arguments);
-    });
-    this.serializedMessageSender = withSerializer(serializer)(function () {
-      var _this$browserAPI$runt;
-
-      return (_this$browserAPI$runt = _this.browserAPI.runtime).sendMessage.apply(_this$browserAPI$runt, arguments);
-    }, 1);
-    this.listeners = [];
-    this.state = state;
-    this.patchStrategy = patchStrategy; // Don't use shouldDeserialize here, since no one else should be using this port
-
-    this.serializedPortListener(function (message) {
-      switch (message.type) {
-        case ACTION_TYPE:
-          _this.dispatch(_objectSpread2(_objectSpread2({}, message.payload), {}, {
-            fromBackground: true
-          }));
-
-          break;
-
-        case STATE_TYPE:
-          _this.replaceState(message.payload);
-
-          if (!_this.readyResolved) {
-            _this.readyResolved = true;
-
-            _this.readyResolve();
-          }
-
-          break;
-
-        case PATCH_STATE_TYPE:
-          _this.patchState(message.payload);
-
-          break;
-
-      }
-    });
     this.dispatch = this.dispatch.bind(this); // add this context to dispatch
+    // finally connect
+
+    this.connect(deserializer);
   }
   /**
-  * Returns a promise that resolves when the store is ready. Optionally a callback may be passed in instead.
-  * @param [function] callback An optional callback that may be passed in and will fire when the store is ready.
-  * @return {object} promise A promise that resolves when the store has established a connection with the background page.
-  */
+   * Connects and creates a port for handling messages between background and
+   * this store. Automatically reconnects when port becomes disconnected.
+   */
 
 
   _createClass(Store, [{
+    key: "connect",
+    value: function connect(deserializer) {
+      var _this2 = this;
+
+      var attempts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0;
+
+      if (attempts > this.maxReconnects) {
+        throw new Error("Too many connection attempts");
+      } // wake up service worker and then connect
+
+
+      this.port = this.browserAPI.runtime.connect(this.extensionId, {
+        name: this.portName
+      });
+      this.port.onDisconnect.addListener(function () {
+        setTimeout(function () {
+          return _this2.connect(deserializer, ++attempts);
+        }, 0);
+      });
+      this.serializedPortListener = withDeserializer(deserializer)(function () {
+        var _this2$port$onMessage;
+
+        (_this2$port$onMessage = _this2.port.onMessage).addListener.apply(_this2$port$onMessage, arguments);
+      }); // Don't use shouldDeserialize here, since no one else should be using this port
+
+      this.serializedPortListener(function (message) {
+        switch (message.type) {
+          case ACTION_TYPE:
+            _this2.dispatch(_objectSpread2(_objectSpread2({}, message.payload), {}, {
+              fromBackground: true
+            }));
+
+            break;
+
+          case STATE_TYPE:
+            _this2.replaceState(message.payload);
+
+            if (!_this2.readyResolved) {
+              _this2.readyResolved = true;
+
+              _this2.readyResolve();
+            }
+
+            break;
+
+          case PATCH_STATE_TYPE:
+            _this2.patchState(message.payload);
+
+            break;
+
+        }
+      });
+    }
+    /**
+    * Returns a promise that resolves when the store is ready. Optionally a callback may be passed in instead.
+    * @param [function] callback An optional callback that may be passed in and will fire when the store is ready.
+    * @return {object} promise A promise that resolves when the store has established a connection with the background page.
+    */
+
+  }, {
     key: "ready",
     value: function ready() {
       var cb = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : null;
@@ -1146,11 +1176,11 @@ var Store = /*#__PURE__*/function () {
   }, {
     key: "subscribe",
     value: function subscribe(listener) {
-      var _this2 = this;
+      var _this3 = this;
 
       this.listeners.push(listener);
       return function () {
-        _this2.listeners = _this2.listeners.filter(function (l) {
+        _this3.listeners = _this3.listeners.filter(function (l) {
           return l !== listener;
         });
       };
@@ -1209,7 +1239,7 @@ var Store = /*#__PURE__*/function () {
   }, {
     key: "dispatch",
     value: function dispatch() {
-      var _this3 = this;
+      var _this4 = this;
 
       var _ref2 = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {},
           fromBackground = _ref2.fromBackground,
@@ -1221,13 +1251,13 @@ var Store = /*#__PURE__*/function () {
       }
 
       return new Promise(function (resolve, reject) {
-        _this3.serializedMessageSender(_this3.extensionId, {
+        _this4.serializedMessageSender(_this4.extensionId, {
           type: DISPATCH_TYPE,
-          portName: _this3.portName,
+          portName: _this4.portName,
           payload: data
         }, null, function (resp) {
           if (!resp) {
-            var _error = _this3.browserAPI.runtime.lastError;
+            var _error = _this4.browserAPI.runtime.lastError;
             var bgErr = new Error("".concat(backgroundErrPrefix).concat(_error));
             reject(lodash_assignin(bgErr, _error));
             return;
